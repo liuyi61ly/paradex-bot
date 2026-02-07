@@ -240,7 +240,7 @@ class ParadexWebsocketClient:
 
                 self.ws = await websockets.connect(self.api_url, **connect_kwargs)
 
-            self.logger.info(f"{self.classname}: Connected to {self.api_url}")
+            self.logger.debug(f"{self.classname}: Connected to {self.api_url}")
 
             # Start reader task if auto_start_reader is enabled and not already running
             if self.auto_start_reader and self._reader_task is None:
@@ -248,7 +248,7 @@ class ParadexWebsocketClient:
 
             if self.account:
                 await self._send_auth_id(self.ws, self.account.jwt_token)
-                self.logger.info(f"{self.classname}: Authenticated to {self.api_url}")
+                self.logger.debug(f"{self.classname}: Authenticated")
         except (
             websockets.exceptions.ConnectionClosedOK,
             websockets.exceptions.ConnectionClosed,
@@ -357,7 +357,7 @@ class ParadexWebsocketClient:
             # Check for successful subscription
             channel_subscribed: str | None = message.get("result", {}).get("channel")
             if channel_subscribed:
-                self.logger.info(f"{self.classname}: Subscribed to channel:{channel_subscribed}")
+                self.logger.debug(f"{self.classname}: Subscribed to channel:{channel_subscribed}")
                 self.subscribed_channels[channel_subscribed] = True
             # Check for subscription error
             error_info = message.get("error")
@@ -576,7 +576,7 @@ class ParadexWebsocketClient:
         else:
             channel_name = channel.value.format(**params)
         self.callbacks[channel_name] = callback
-        self.logger.info(f"{self.classname}: Subscribe channel:{channel_name} params:{params} callback:{callback}")
+        self.logger.debug(f"{self.classname}: Subscribe channel:{channel_name}")
         await self._subscribe_to_channel_by_name(channel_name)
 
     async def subscribe_by_name(
@@ -595,7 +595,7 @@ class ParadexWebsocketClient:
         """
         if callback is not None:
             self.callbacks[channel_name] = callback
-            self.logger.info(f"{self.classname}: Subscribe by name channel:{channel_name} callback:{callback}")
+            self.logger.debug(f"{self.classname}: Subscribe channel:{channel_name}")
 
         await self._subscribe_to_channel_by_name(channel_name)
 
