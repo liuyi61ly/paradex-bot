@@ -591,7 +591,7 @@ class ParadexApiClient(BlockTradesMixin, HttpClient):
             base_url = re.sub(r"/rpc/v\d+[._]\d+.*$", "", res["starknet_fullnode_rpc_url"])
             res["starknet_fullnode_rpc_base_url"] = base_url
         config = SystemConfigSchema().load(res, unknown="exclude", partial=True)
-        self.logger.info(f"{self.classname}: SystemConfig:{config}")
+        # self.logger.info(f"{self.classname}: SystemConfig: {config}")
         return config
 
     def fetch_system_state(self) -> dict:
