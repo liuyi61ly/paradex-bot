@@ -11,7 +11,15 @@ BTC-USDT 套利策略示例
   - 24小时: 1000 次订单
 
 每次反向开仓会产生 2 个订单请求（账户1和账户2各一个订单）
+
+自动停止条件：
+  - 成交达到 1000 次时自动停止
+  - 检测到任何手续费 > 0 时立即停止并记录原因
 """
+
+# ========== 快速刷单配置 ==========
+TARGET_TRADES = 1000  # 目标成交次数，达到后自动停止
+STOP_LOG_FILE = "stop_reason.log"  # 停止原因日志文件
 import asyncio
 import os
 import logging
@@ -68,6 +76,34 @@ if LOG_FILE:
 else:
     from paradex_py.common.console_logging import console_logger
     logger = console_logger
+
+
+# ============================================================
+# 停止程序辅助函数
+# ============================================================
+
+def write_stop_log(reason: str) -> None:
+    """写入停止原因到日志文件"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = f"[{timestamp}] {reason}\n"
+    with open(STOP_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(log_entry)
+    print(f"\n📝 已写入停止日志: {STOP_LOG_FILE}")
+    print(f"   原因: {reason}")
+
+
+def check_fee_and_maybe_stop(fee: str, account: str) -> bool:
+    """
+    检查手续费，如果 > 0 则停止程序
+    返回: True 表示检测到手续费，程序应该停止
+    """
+    try:
+        if fee and float(fee) > 0:
+            write_stop_log(f"检测到手续费 > 0 | 账户: {account[-8:]} | 手续费: {fee}")
+            return True
+    except (ValueError, TypeError):
+        pass
+    return False
 
 
 # ============================================================
@@ -251,6 +287,11 @@ class ArbitrageBot:
         self._cache_timestamp: Optional[datetime] = None
         self._cache_ttl = 2.0  # 缓存2秒
 
+        # 预计算交易信息（价差检测前就准备好）
+        self._precomputed_trade_info: Optional[tuple] = None
+        self._precompute_timestamp: Optional[datetime] = None
+        self._precompute_ttl = 2.0  # 预计算缓存2秒
+
         # 交易状态
         self.trading_enabled = True
         self.last_trade_time = None
@@ -340,27 +381,26 @@ class ArbitrageBot:
             'current_direction': str or None,
         }
         """
+        now = datetime.now()
+
+        # 检查缓存是否有效
+        if (self._cached_account_info is not None and
+            self._cache_timestamp is not None and
+            (now - self._cache_timestamp).total_seconds() < self._cache_ttl):
+            return self._cached_account_info
+
+        # 缓存过期，重新查询（优化：减少 API 调用次数）
+        # 优化：两个账户的信息可以并行获取
         try:
-            now = datetime.now()
+            summary1, summary2, positions1, positions2 = self._fetch_all_account_info_parallel()
 
-            # 检查缓存是否有效
-            if (self._cached_account_info is not None and
-                self._cache_timestamp is not None and
-                (now - self._cache_timestamp).total_seconds() < self._cache_ttl):
-                return self._cached_account_info
-
-            # 缓存过期，重新查询
-            free1 = self._fetch_free_collateral(self.account1)
-            free2 = self._fetch_free_collateral(self.account2)
+            free1 = self._to_decimal(getattr(summary1, "free_collateral", 0) or 0)
+            free2 = self._to_decimal(getattr(summary2, "free_collateral", 0) or 0)
             min_free = min(free1, free2)
 
-            # 获取账户总价值（用于计算名义价值）
-            account_value1 = self._fetch_account_value(self.account1)
-            account_value2 = self._fetch_account_value(self.account2)
+            account_value1 = self._to_decimal(getattr(summary1, "account_value", 0) or 0)
+            account_value2 = self._to_decimal(getattr(summary2, "account_value", 0) or 0)
             min_account_value = min(account_value1, account_value2)
-
-            positions1 = self._fetch_positions(self.account1)
-            positions2 = self._fetch_positions(self.account2)
 
             pos1 = None
             pos2 = None
@@ -407,7 +447,7 @@ class ArbitrageBot:
         except KeyboardInterrupt:
             raise  # 重新抛出，让上层处理
         except Exception as e:
-            logger.error(f"获取账户信息失败: {e}", exc_info=True)
+            logger.error(f"获取账户信息失败: {e}")
             return {
                 'free1': Decimal("0"),
                 'free2': Decimal("0"),
@@ -423,6 +463,99 @@ class ArbitrageBot:
                 'pos2_size': 0,
                 'current_direction': None,
             }
+
+    def _fetch_all_account_info_parallel(self) -> tuple:
+        """并行获取所有账户信息（优化：减少 API 调用和等待时间）"""
+        from concurrent.futures import ThreadPoolExecutor
+
+        def fetch_one(paradex):
+            """获取单个账户的所有信息"""
+            try:
+                summary = paradex.api_client.fetch_account_summary()
+                positions = paradex.api_client.fetch_positions()
+                return summary, positions
+            except Exception as e:
+                logger.error(f"获取账户信息失败: {e}")
+                return None, None
+
+        # 使用线程池并行获取两个账户的信息
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future1 = executor.submit(fetch_one, self.account1)
+            future2 = executor.submit(fetch_one, self.account2)
+
+            result1 = future1.result()
+            result2 = future2.result()
+
+        summary1, positions1 = result1 if result1 else (None, None)
+        summary2, positions2 = result2 if result2 else (None, None)
+
+        return summary1, summary2, positions1 or {"results": []}, positions2 or {"results": []}
+
+    def _precompute_trade_info(self) -> bool:
+        """预计算交易信息（提前准备好，等价差满足条件时直接用）
+
+        在 WebSocket 的 BBO 更新中调用，当检测到价差时可以直接使用缓存的结果
+        """
+        try:
+            now = datetime.now()
+
+            # 检查预计算缓存是否有效
+            if (self._precomputed_trade_info is not None and
+                self._precompute_timestamp is not None and
+                (now - self._precompute_timestamp).total_seconds() < self._precompute_ttl):
+                return True  # 缓存有效
+
+            # 检查账户信息缓存是否有效（需要先获取账户信息）
+            if (self._cached_account_info is None or
+                self._cache_timestamp is None or
+                (now - self._cache_timestamp).total_seconds() >= self._cache_ttl):
+                # 刷新账户信息缓存
+                self._get_cached_account_info()
+
+            if self._cached_account_info is None:
+                return False
+
+            # 获取当前价格（使用缓存的 bid/ask）
+            if self.current_bid is None or self.current_ask is None:
+                return False
+
+            # 计算目标方向和交易信息
+            price = (self.current_bid + self.current_ask) / 2
+            target_side = self._get_opposite_side()
+
+            # 提前计算两个方向的交易信息
+            self._precomputed_trade_info = {
+                'price': price,
+                'target_side': target_side,
+                'trade_data': self._compute_trade_size_from_funds(price, target_side),
+            }
+            self._precompute_timestamp = now
+
+            return True
+
+        except Exception as e:
+            logger.error(f"预计算交易信息失败: {e}")
+            return False
+
+    def _get_precomputed_trade_info(self, price: Decimal = None) -> tuple:
+        """获取预计算的交易信息，如果缓存过期则重新计算"""
+        now = datetime.now()
+
+        # 检查缓存是否有效
+        if (self._precomputed_trade_info is not None and
+            self._precompute_timestamp is not None and
+            (now - self._precompute_timestamp).total_seconds() < self._precompute_ttl):
+            return self._precomputed_trade_info['trade_data']
+
+        # 缓存过期，使用传入的价格重新计算
+        if price is None:
+            price = (self.current_bid + self.current_ask) / 2 if self.current_bid and self.current_ask else None
+
+        if price is None:
+            return None
+
+        target_side = self._get_opposite_side()
+        return self._compute_trade_size_from_funds(price, target_side)
 
     def _compute_trade_size_from_funds(self, price: Decimal, target_side: str) -> tuple[Decimal, Decimal, Decimal, dict]:
         """
@@ -714,7 +847,12 @@ class ArbitrageBot:
             try:
                 await rate_limiter.acquire(timeout=30)
                 result = self.account1.api_client.submit_order(order=close_order)
-                logger.info(f"账户1平仓结果: {result}")
+                # 简化输出，只显示关键信息
+                order_id = result.get('id', '?')[-8:]
+                status = result.get('status', '?')
+                side = result.get('side', '?')
+                size = result.get('size', '?')
+                logger.info(f"账户1平仓: id={order_id}, status={status}, {side} {size}")
             except Exception as e:
                 logger.error(f"账户1平仓失败: {e}")
                 success = False
@@ -745,7 +883,12 @@ class ArbitrageBot:
             try:
                 await rate_limiter.acquire(timeout=30)
                 result = self.account2.api_client.submit_order(order=close_order)
-                logger.info(f"账户2平仓结果: {result}")
+                # 简化输出，只显示关键信息
+                order_id = result.get('id', '?')[-8:]
+                status = result.get('status', '?')
+                side = result.get('side', '?')
+                size = result.get('size', '?')
+                logger.info(f"账户2平仓: id={order_id}, status={status}, {side} {size}")
             except Exception as e:
                 logger.error(f"账户2平仓失败: {e}")
                 success = False
@@ -784,12 +927,24 @@ class ArbitrageBot:
             self.current_ask = ask
             self.last_price_update = datetime.now()
 
+            # 预计算交易信息（提前准备好，等价差满足条件时直接用）
+            self._precompute_trade_info()
+
             spread = ask - bid
             spread_pct = (spread / ask) * 100
 
             # 检查是否满足交易条件
             if spread_pct <= self.min_spread and self.trading_enabled:
-                await self.execute_arbitrage(bid, ask, spread)
+                # 记录价差检测时间
+                detect_time = datetime.now()
+                detect_time_str = detect_time.strftime("%H:%M:%S.%f")[:-3]
+                should_continue = await self.execute_arbitrage(bid, ask, spread, detect_time)
+                # 如果返回 False，表示应该停止程序
+                if not should_continue:
+                    logger.info("🛑 收到停止信号，正在停止...")
+                    self.trading_enabled = False
+                    # 写入最终日志
+                    write_stop_log(f"在第 {self.successful_trades} 次成交后停止")
 
         except KeyboardInterrupt:
             # 捕获 Ctrl+C，记录日志即可
@@ -799,44 +954,89 @@ class ArbitrageBot:
         except Exception as e:
             logger.error(f"处理BBO更新时出错: {e}", exc_info=True)
 
-    async def execute_arbitrage(self, bid: Decimal, ask: Decimal, spread: Decimal) -> None:
+    async def execute_arbitrage(self, bid: Decimal, ask: Decimal, spread: Decimal, detect_time: datetime = None) -> bool:
         """执行反向开仓
 
         策略逻辑：
         - 首次开仓：直接开多/空（2个订单）
         - 反向开仓：合并平仓+开仓为一个订单（2个订单）
+
+        detect_time: 价差检测到的时间
+
+        返回: True 表示正常完成，False 表示因手续费或其他原因应该停止
         """
-        # 检查速率限制
+        if detect_time is None:
+            detect_time = datetime.now()
+        detect_time_str = detect_time.strftime("%H:%M:%S.%f")[:-3]
+
+        # ========== 性能分析：记录每个步骤耗时 ==========
+        step_times = {}
+
+        # 步骤1: 检查速率限制
+        t1 = datetime.now()
         if not await self._check_rate_limit():
             logger.warning("⚠️ 因速率限制跳过本次机会")
-            return
+            return True
+        step_times['rate_check'] = (datetime.now() - t1).total_seconds() * 1000
 
-        # 检查交易间隔
+        # 步骤2: 检查交易间隔
+        t2 = datetime.now()
         if self.last_trade_time:
             time_since_last = (datetime.now() - self.last_trade_time).total_seconds()
             if time_since_last < self.min_trade_interval:
-                return
+                return True
+        step_times['interval_check'] = (datetime.now() - t2).total_seconds() * 1000
 
-        # 获取应该开仓的方向
+        # 记录检测到开始执行的时间
+        prepare_to_submit_ms = (datetime.now() - detect_time).total_seconds() * 1000
+
+        # 步骤3: 获取开仓方向
+        t3 = datetime.now()
         target_side = self._get_opposite_side()
+        step_times['get_side'] = (datetime.now() - t3).total_seconds() * 1000
 
-        # 获取开仓信息（包含平仓+开仓详情）
-        _, _, _, info = self._compute_trade_size_from_funds((bid + ask) / 2, target_side)
+        # 步骤4: 计算交易大小
+        t4 = datetime.now()
+        precomputed = self._get_precomputed_trade_info((bid + ask) / 2)
+        close_size, open_size, total_size, info = precomputed or self._compute_trade_size_from_funds((bid + ask) / 2, target_side)
+        step_times['calc_size'] = (datetime.now() - t4).total_seconds() * 1000
+
+        # 步骤5: 获取深度数据（API调用）- 已注释，跳过
+        # t5 = datetime.now()
+        # orderbook = self.account1.api_client.fetch_orderbook(market=self.market, params={"depth": 1})
+        # step_times['fetch_orderbook'] = (datetime.now() - t5).total_seconds() * 1000
+
+        # 步骤5: 深度检查 - 已注释，直接通过
+        # t6 = datetime.now()
+        # if orderbook and 'bids' in orderbook and 'asks' in orderbook:
+        #     best_bid_size = self._to_decimal(orderbook['bids] if orderbook'][0][1['bids'] else 0)
+        #     best_ask_size = self._to_decimal(orderbook['asks'][0][1] if orderbook['asks'] else 0)
+        #     required_size = open_size * Decimal("1.5")
+        #     if best_bid_size < required_size or best_ask_size < required_size:
+        #         logger.warning(f"⚠️ 深度不足，跳过交易")
+        #         return True
+        # step_times['depth_check'] = (datetime.now() - t6).total_seconds() * 1000
+
+        # 步骤6: 获取速率限制许可
+        t7 = datetime.now()
+        success, reason, waited = await rate_limiter.acquire(timeout=60.0)
+        if not success:
+            logger.error(f"❌ 无法获取速率限制许可: {reason}")
+            return True
+        step_times['rate_limiter'] = (datetime.now() - t7).total_seconds() * 1000
+        if waited > 0:
+            step_times['rate_limiter_wait'] = waited * 1000
+            logger.info(f"⏳ 等待了 {waited:.1f} 秒")
+
+        # 打印步骤耗时（不包括下单）
+        total_step_time = sum(step_times.values())
+        logger.info(f"📊 步骤耗时: {', '.join([f'{k}:{v:.0f}ms' for k,v in step_times.items()])}")
+        logger.info(f"📊 准备阶段总耗时: {total_step_time:.0f}ms")
 
         logger.info("=" * 60)
         logger.info(f"🔄 执行 {'首次开仓' if info['is_first_trade'] else '反向开仓'}: {target_side}")
         logger.info(f"  之前方向: {self.current_position or '无持仓'}")
         logger.info(f"  买一: {bid}, 卖一: {ask}")
-
-        # 获取速率限制许可
-        success, reason, waited = await rate_limiter.acquire(timeout=60.0)
-        if not success:
-            logger.error(f"❌ 无法获取速率限制许可: {reason}")
-            logger.info("=" * 60)
-            return
-
-        if waited > 0:
-            logger.info(f"⏳ 等待了 {waited:.1f} 秒")
 
         # 创建订单
 
@@ -922,49 +1122,127 @@ class ArbitrageBot:
             logger.info(f"  {desc1}: {order1}")
             logger.info(f"  {desc2}: {order2}")
 
-            # 并行提交订单（与 test_open_position.py 方式一致）
-            result1, result2 = await asyncio.gather(
-                self._submit_order(self.account1, order1),
-                self._submit_order(self.account2, order2),
-                return_exceptions=True
-            )
+            # 并行提交订单（真正并行执行）
+            order_time = datetime.now()
+            order_time_str = order_time.strftime("%H:%M:%S.%f")[:-3]
 
-            success1 = not isinstance(result1, Exception) and result1 is not None
-            success2 = not isinstance(result2, Exception) and result2 is not None
+            # 分别记录开始时间
+            t1 = datetime.now()
+            t2 = datetime.now()
+
+            # 辅助函数
+            async def submit_timed(account, order, start):
+                result = await self._submit_order_detailed(account, order)
+                elapsed = (datetime.now() - start).total_seconds() * 1000
+                return result, elapsed
+
+            # 使用 gather 并行执行
+            (r1, t1_ms), (r2, t2_ms) = await asyncio.gather(
+                submit_timed(self.account1, order1, t1),
+                submit_timed(self.account2, order2, t2)
+            )
+            result1, result2 = r1, r2
+            submit1_ms, submit2_ms = t1_ms, t2_ms
+
+            logger.info(f"  ⏱️ 账户1总耗时: {submit1_ms:.0f}ms | 账户2总耗时: {submit2_ms:.0f}ms")
+
+            success1 = result1 is not None and not isinstance(result1, Exception)
+            success2 = result2 is not None and not isinstance(result2, Exception)
 
             if success1 and success2:
                 self.successful_trades += 1
                 logger.info(f"✅ {'首次开仓' if info['is_first_trade'] else '反向开仓'}成功！")
                 self.current_position = target_side
                 self.current_trade_size = Decimal(str(info['open_size']))
-                # 清空缓存，确保下次获取最新数据
-                self._cached_account_info = None
-                self._cache_timestamp = None
 
-                # 等待 1 秒后查询成交记录（与 test_open_position.py 一致）
-                await asyncio.sleep(1)
+                # 更新持仓缓存（而不是清空缓存），避免下次获取时 API 返回的还是平仓前的状态
+                # 直接使用交易结果更新缓存的持仓信息
+                trade_size = float(info['total_size'])
+                if target_side == "LONG":
+                    new_pos1_size = trade_size
+                    new_pos2_size = -trade_size
+                else:  # SHORT
+                    new_pos1_size = -trade_size
+                    new_pos2_size = trade_size
+
+                if self._cached_account_info is not None:
+                    # 缓存存在，更新持仓信息
+                    self._cached_account_info['pos1_size'] = new_pos1_size
+                    self._cached_account_info['pos2_size'] = new_pos2_size
+                    self._cached_account_info['current_direction'] = target_side
+                    # 更新持仓记录
+                    if self._cached_account_info.get('pos1'):
+                        self._cached_account_info['pos1']['size'] = new_pos1_size
+                    if self._cached_account_info.get('pos2'):
+                        self._cached_account_info['pos2']['size'] = new_pos2_size
+                else:
+                    # 缓存不存在，创建新的缓存（首次开仓后）
+                    self._cached_account_info = {
+                        'pos1_size': new_pos1_size,
+                        'pos2_size': new_pos2_size,
+                        'current_direction': target_side,
+                    }
+                    self._cache_timestamp = datetime.now()
+
+                # 等待 0.5 秒后查询成交记录（加快速度）
+                await asyncio.sleep(0.5)
                 logger.info("查询成交记录...")
 
                 fills1 = await self._fetch_fills(self.account1, self.market)
                 fills2 = await self._fetch_fills(self.account2, self.market)
 
+                has_fee = False
+                fee_account = ""
+
                 # 账户1成交记录
                 if fills1.get("results"):
                     fill = fills1["results"][0]
+                    fill_time_str = datetime.fromtimestamp(fill.get('created_at', 0) / 1000).strftime("%H:%M:%S.%f")[:-3]
+                    order_to_fill_ms = fill.get('created_at', 0) - int(order_time.timestamp() * 1000)
+                    detect_to_fill_ms = fill.get('created_at', 0) - int(detect_time.timestamp() * 1000)
+                    fill_price = fill.get('price', 'N/A')
                     logger.info(f"  📊 账户1成交:")
-                    logger.info(f"    成交ID: {fill.get('id', 'N/A')}")
-                    logger.info(f"    价格: {fill.get('price', 'N/A')}")
+                    logger.info(f"    ⏱️ 时间线: 检测={detect_time_str} → 下单={order_time_str} → 成交={fill_time_str}")
+                    logger.info(f"    ⏱️ 耗时: 检测→下单前 {prepare_to_submit_ms:.0f}ms | 下单→成交 {order_to_fill_ms/1000:.2f}s | 检测→成交 {detect_to_fill_ms/1000:.2f}s")
+                    logger.info(f"    价格: {fill_price}")
                     logger.info(f"    数量: {fill.get('size', 'N/A')}")
                     logger.info(f"    手续费: {fill.get('fee', 'N/A')} {fill.get('fee_token', 'N/A')}")
+                    # 检测手续费
+                    if check_fee_and_maybe_stop(fill.get('fee', '0'), self.account1.account.l2_address):
+                        has_fee = True
+                        fee_account = "账户1"
 
                 # 账户2成交记录
                 if fills2.get("results"):
                     fill = fills2["results"][0]
+                    fill_time_str = datetime.fromtimestamp(fill.get('created_at', 0) / 1000).strftime("%H:%M:%S.%f")[:-3]
+                    order_to_fill_ms = fill.get('created_at', 0) - int(order_time.timestamp() * 1000)
+                    detect_to_fill_ms = fill.get('created_at', 0) - int(detect_time.timestamp() * 1000)
+                    fill_price = fill.get('price', 'N/A')
                     logger.info(f"  📊 账户2成交:")
-                    logger.info(f"    成交ID: {fill.get('id', 'N/A')}")
-                    logger.info(f"    价格: {fill.get('price', 'N/A')}")
+                    logger.info(f"    ⏱️ 时间线: 检测={detect_time_str} → 下单={order_time_str} → 成交={fill_time_str}")
+                    logger.info(f"    ⏱️ 耗时: 检测→下单前 {prepare_to_submit_ms:.0f}ms | 下单→成交 {order_to_fill_ms/1000:.2f}s | 检测→成交 {detect_to_fill_ms/1000:.2f}s")
+                    logger.info(f"    价格: {fill_price}")
                     logger.info(f"    数量: {fill.get('size', 'N/A')}")
                     logger.info(f"    手续费: {fill.get('fee', 'N/A')} {fill.get('fee_token', 'N/A')}")
+                    # 检测手续费
+                    if check_fee_and_maybe_stop(fill.get('fee', '0'), self.account2.account.l2_address):
+                        has_fee = True
+                        fee_account = "账户2"
+
+                # 如果检测到手续费，立即停止并退出程序
+                if has_fee:
+                    write_stop_log(f"检测到手续费 | 账户: {fee_account}")
+                    logger.info("🛑 检测到手续费，程序退出")
+                    os._exit(0)
+                    return False
+
+                # 检查是否达到目标次数
+                if self.successful_trades >= TARGET_TRADES:
+                    write_stop_log(f"达到目标成交次数: {TARGET_TRADES}")
+                    logger.info(f"🛑 达到目标次数 {TARGET_TRADES}，程序退出")
+                    os._exit(0)
+                    return False
             else:
                 self.failed_trades += 1
                 logger.error("❌ 开仓部分失败")
@@ -993,9 +1271,40 @@ class ArbitrageBot:
         )
         logger.info("=" * 60)
 
+        return True
+
     async def _submit_order(self, paradex: Paradex, order: Order) -> dict:
-        """提交订单（与 test_open_position.py 保持一致）"""
-        return paradex.api_client.submit_order(order=order)
+        """提交订单（使用线程池执行同步 HTTP 请求）"""
+        # 在线程池中执行同步的 submit_order
+        return await asyncio.to_thread(paradex.api_client.submit_order, order=order)
+
+    async def _submit_order_detailed(self, paradex: Paradex, order: Order) -> dict:
+        """提交订单（详细分解耗时）"""
+        import time as time_module
+
+        t_start = time_module.time()
+
+        # 1. 序列化
+        t_serialize_start = time_module.time()
+        order_data = order.dump_to_dict()
+        t_serialize = (time_module.time() - t_serialize_start) * 1000
+
+        # 2. 签名
+        t_sign_start = time_module.time()
+        signature = paradex.account.sign_order(order)
+        order_data["signature"] = signature  # 把签名添加到 payload
+        t_sign = (time_module.time() - t_sign_start) * 1000
+
+        # 3. HTTP POST（使用线程池执行同步 HTTP 请求）
+        t_http_start = time_module.time()
+        result = await asyncio.to_thread(paradex.api_client._post_authorized, path="orders", payload=order_data)
+        t_http = (time_module.time() - t_http_start) * 1000
+
+        t_total = (time_module.time() - t_start) * 1000
+
+        logger.info(f"  📊 {str(paradex.account.l2_address)[:8]}... 序列化:{t_serialize:.0f}ms | 签名:{t_sign:.0f}ms | HTTP:{t_http:.0f}ms | 总:{t_total:.0f}ms")
+
+        return result
 
     async def _fetch_fills(self, paradex: Paradex, market: str) -> dict:
         """查询成交记录"""
@@ -1225,8 +1534,13 @@ async def main():
 
     try:
         await bot.start_monitoring()
+        logger.info(f"🚀 开始刷单，目标: {TARGET_TRADES} 次成交 | 检测到手续费将自动停止")
         while True:
             await asyncio.sleep(1)
+            # 显示进度
+            if bot.successful_trades > 0:
+                progress = bot.successful_trades / TARGET_TRADES * 100
+                print(f"\r📊 进度: {bot.successful_trades}/{TARGET_TRADES} ({progress:.1f}%)", end="", flush=True)
 
     except KeyboardInterrupt:
         logger.info("\n🛑 收到 Ctrl+C 信号，正在停止...")
